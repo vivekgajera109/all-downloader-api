@@ -7,6 +7,8 @@ import requests
 import re
 import time
 from bs4 import BeautifulSoup
+import base64
+import urllib.parse
 
 # Initialize logger
 logging.basicConfig(level=logging.INFO)
@@ -324,6 +326,71 @@ def get_facebook_video(url: str = Query(..., description="Facebook video URL")):
 # =====================================================================
 # 🐦 TWITTER / X ENDPOINT
 # =====================================================================
+def scrape_twitter_twitsave(tweet_url: str):
+    logger.info(f"Fallback Twitter scraper triggered for URL: {tweet_url}")
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        encoded_url = urllib.parse.quote(tweet_url, safe='')
+        info_url = f"https://twitsave.com/info?url={encoded_url}"
+        
+        response = requests.get(info_url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            logger.error(f"twitsave.com info endpoint failed: {response.status_code}")
+            return None
+            
+        if "Sorry, we could not find any video on this tweet" in response.text:
+            logger.warning("twitsave.com reported no video found in tweet")
+            return None
+            
+        soup = BeautifulSoup(response.text, "html.parser")
+        download_buttons = soup.find_all("a", href=True)
+        
+        links = []
+        for btn in download_buttons:
+            href = btn['href']
+            text = btn.get_text(strip=True)
+            if "download" in href or "download" in text.lower():
+                links.append(href)
+                
+        resolved_links = []
+        for l in links:
+            if l.startswith("/"):
+                resolved_links.append(f"https://twitsave.com{l}")
+            else:
+                resolved_links.append(l)
+                
+        filtered = [l for l in resolved_links if "twitsave.com" in l and "download" in l]
+        if not filtered and resolved_links:
+            filtered = resolved_links
+            
+        if filtered:
+            target_url = filtered[0]
+            try:
+                parsed = urllib.parse.urlparse(target_url)
+                params = urllib.parse.parse_qs(parsed.query)
+                if 'file' in params:
+                    encoded_file = params['file'][0]
+                    missing_padding = len(encoded_file) % 4
+                    if missing_padding:
+                        encoded_file += '=' * (4 - missing_padding)
+                    decoded_file = base64.b64decode(encoded_file).decode('utf-8')
+                    logger.info(f"Successfully scraped and decoded Twitsave video URL: {decoded_file}")
+                    return decoded_file
+            except Exception as decode_err:
+                logger.warning(f"Failed to decode Twitsave file parameter: {decode_err}")
+                
+            logger.info(f"Successfully scraped Twitsave video URL (undecoded): {target_url}")
+            return target_url
+            
+        return None
+    except Exception as e:
+        logger.error(f"Twitsave scraper exception: {e}")
+        return None
+
 @app.post("/twitter")
 def get_twitter_video(request: TwitterRequest):
     url = request.url
@@ -354,5 +421,16 @@ def get_twitter_video(request: TwitterRequest):
                 "download_url": video_url
             }
     except Exception as e:
-        logger.error(f"Twitter Fetch Error: {str(e)}")
+        logger.warning(f"yt-dlp failed to fetch Twitter/X Video ({str(e)}). Retrying with Twitsave fallback scraper...")
+        try:
+            fallback_url = scrape_twitter_twitsave(url)
+            if fallback_url:
+                logger.info(f"Fallback scraper successfully retrieved direct video URL: {fallback_url}")
+                return {
+                    "download_url": fallback_url
+                }
+        except Exception as fallback_err:
+            logger.error(f"Fallback scraper also failed: {fallback_err}")
+            
+        logger.error(f"Twitter Fetch Error (both yt-dlp and fallback failed): {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Twitter/X Video: {str(e)}")
