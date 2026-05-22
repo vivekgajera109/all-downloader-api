@@ -326,6 +326,98 @@ def get_facebook_video(url: str = Query(..., description="Facebook video URL")):
 # =====================================================================
 # 🐦 TWITTER / X ENDPOINT
 # =====================================================================
+def get_twitter_token(tweet_id: str) -> str:
+    try:
+        tweet_id_int = int(tweet_id)
+    except ValueError:
+        return "!"
+    val = (float(tweet_id_int) / 1e15) * math.pi
+    integer_part = int(val)
+    fraction_part = val - integer_part
+    alphabet = '0123456789abcdefghijklmnopqrstuvwxyz'
+    def base36encode(number):
+        if number == 0:
+            return '0'
+        base36 = ''
+        while number != 0:
+            number, i = divmod(number, 36)
+            base36 = alphabet[i] + base36
+        return base36
+    int_str = base36encode(integer_part)
+    frac_str = ''
+    frac = fraction_part
+    for _ in range(12):
+        if frac == 0:
+            break
+        frac *= 36
+        digit_val = int(frac)
+        frac_str += alphabet[digit_val]
+        frac -= digit_val
+    combined = (int_str + frac_str).replace('0', '')
+    return combined
+
+import math
+
+def scrape_twitter_syndication(tweet_url: str):
+    logger.info(f"Syndication Twitter scraper triggered for URL: {tweet_url}")
+    try:
+        match = re.search(r'/status/(\d+)', tweet_url)
+        if not match:
+            logger.error("Could not parse tweet ID from URL")
+            return None
+        tweet_id = match.group(1)
+        
+        token = get_twitter_token(tweet_id)
+        url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token={token}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        }
+        res = requests.get(url, headers=headers, timeout=10)
+        
+        if res.status_code != 200:
+            url_fallback = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token=!"
+            res = requests.get(url_fallback, headers=headers, timeout=10)
+            
+        if res.status_code != 200:
+            logger.error(f"Syndication API returned status code: {res.status_code}")
+            return None
+            
+        data = res.json()
+        media_details = data.get("mediaDetails", [])
+        if not media_details:
+            logger.warning("No media found in tweet-result")
+            return None
+            
+        media = media_details[0]
+        m_type = media.get("type")
+        if m_type == "photo":
+            img_url = media.get("media_url_https")
+            if img_url:
+                if "?" in img_url:
+                    img_url = img_url.split("?")[0]
+                img_url = f"{img_url}?name=large"
+                return {
+                    "download_url": img_url,
+                    "type": "image"
+                }
+        elif m_type in ("video", "animated_gif"):
+            video_info = media.get("video_info", {})
+            variants = video_info.get("variants", [])
+            mp4_variants = [v for v in variants if v.get("content_type") == "video/mp4" or "mp4" in v.get("url", "")]
+            if mp4_variants:
+                mp4_variants.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
+                best_video = mp4_variants[0].get("url")
+                if best_video:
+                    return {
+                        "download_url": best_video,
+                        "type": "video"
+                    }
+        return None
+    except Exception as e:
+        logger.error(f"Syndication scraper exception: {e}")
+        return None
+
 def scrape_twitter_twitsave(tweet_url: str):
     logger.info(f"Fallback Twitter scraper triggered for URL: {tweet_url}")
     try:
@@ -416,21 +508,31 @@ def get_twitter_video(request: TwitterRequest):
             if not video_url:
                 raise Exception("Could not find direct video URL")
 
-            # Return response in the structure expected by twitter_provider.dart
             return {
-                "download_url": video_url
+                "download_url": video_url,
+                "type": "video"
             }
     except Exception as e:
-        logger.warning(f"yt-dlp failed to fetch Twitter/X Video ({str(e)}). Retrying with Twitsave fallback scraper...")
+        logger.warning(f"yt-dlp failed to fetch Twitter/X Video ({str(e)}). Retrying with Syndication scraper...")
+        try:
+            syndication_media = scrape_twitter_syndication(url)
+            if syndication_media:
+                logger.info(f"Syndication scraper successfully retrieved: {syndication_media}")
+                return syndication_media
+        except Exception as synd_err:
+            logger.error(f"Syndication scraper also failed: {synd_err}")
+
+        logger.warning("Syndication scraper failed. Retrying with Twitsave fallback scraper...")
         try:
             fallback_url = scrape_twitter_twitsave(url)
             if fallback_url:
                 logger.info(f"Fallback scraper successfully retrieved direct video URL: {fallback_url}")
                 return {
-                    "download_url": fallback_url
+                    "download_url": fallback_url,
+                    "type": "video"
                 }
         except Exception as fallback_err:
             logger.error(f"Fallback scraper also failed: {fallback_err}")
             
-        logger.error(f"Twitter Fetch Error (both yt-dlp and fallback failed): {str(e)}")
+        logger.error(f"Twitter Fetch Error (all scrapers failed): {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Twitter/X Video: {str(e)}")
