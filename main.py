@@ -3,6 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
 import logging
+import requests
+import re
+import time
+from bs4 import BeautifulSoup
 
 # Initialize logger
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +42,153 @@ def home():
 # =====================================================================
 # 📸 INSTAGRAM ENDPOINT (Supports both Reels and Posts)
 # =====================================================================
+def scrape_instagram(target_url: str):
+    logger.info(f"Fallback scraper triggered for URL: {target_url}")
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-GPC": "1",
+        })
+        
+        # 1. Fetch saveinsta.to highlights page to get tokens
+        res = session.get("https://saveinsta.to/en/highlights", headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Referer": "https://www.google.com/",
+        }, timeout=10)
+        
+        if res.status_code != 200:
+            logger.error(f"Failed to fetch highlights page, status code: {res.status_code}")
+            return None
+            
+        html = res.text
+        script_match = re.search(r'<script[^>]*>var\s+k_url_search="[^"]+"(.*?)</script>', html, re.DOTALL)
+        if not script_match:
+            script_content = html
+        else:
+            script_content = script_match.group(1)
+            
+        k_exp_match = re.search(r'k_exp\s*=\s*"([^"]+)"', script_content)
+        k_token_match = re.search(r'k_token\s*=\s*"([^"]+)"', script_content)
+        
+        if not k_exp_match or not k_token_match:
+            k_exp_match = re.search(r'k_exp\s*=\s*"([^"]+)"', html)
+            k_token_match = re.search(r'k_token\s*=\s*"([^"]+)"', html)
+            
+        if not k_exp_match or not k_token_match:
+            logger.error("Could not extract k_exp or k_token")
+            return None
+            
+        k_exp = k_exp_match.group(1)
+        k_token = k_token_match.group(1)
+        
+        time.sleep(1)
+        
+        # 2. Get CF token (userverify)
+        verify_url = "https://saveinsta.to/api/userverify"
+        verify_headers = {
+            "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://saveinsta.to",
+            "Referer": "https://saveinsta.to/en/video",
+            "X-Requested-With": "XMLHttpRequest"
+        }
+        
+        verify_res = session.post(verify_url, data={"url": target_url}, headers=verify_headers, timeout=10)
+        if verify_res.status_code != 200:
+            logger.error(f"Failed to verify user, status code: {verify_res.status_code}")
+            return None
+            
+        try:
+            verify_data = verify_res.json()
+        except Exception as e:
+            logger.error(f"Failed to parse verify response: {e}")
+            return None
+            
+        cftoken = verify_data.get("token")
+        if not cftoken:
+            logger.error("CF token not returned in JSON")
+            return None
+            
+        time.sleep(1)
+        
+        # 3. Call ajaxSearch
+        search_url = "https://saveinsta.to/api/ajaxSearch"
+        search_headers = {
+            "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://saveinsta.to",
+            "Referer": "https://saveinsta.to/en/highlights",
+            "X-Requested-With": "XMLHttpRequest"
+        }
+        
+        search_data = {
+            "k_exp": k_exp,
+            "k_token": k_token,
+            "q": target_url,
+            "t": "media",
+            "lang": "en",
+            "v": "v2",
+            "cftoken": cftoken
+        }
+        
+        search_res = session.post(search_url, data=search_data, headers=search_headers, timeout=10)
+        if search_res.status_code != 200:
+            logger.error(f"ajaxSearch failed, status code: {search_res.status_code}")
+            return None
+            
+        try:
+            search_json = search_res.json()
+        except Exception as e:
+            logger.error(f"Failed to parse search response: {e}")
+            return None
+            
+        if search_json.get("status") != "ok" or "data" not in search_json:
+            logger.error("Invalid status or missing data in ajaxSearch response")
+            return None
+            
+        html_data = search_json["data"]
+        
+        # 4. Parse HTML
+        soup = BeautifulSoup(html_data, 'html.parser')
+        
+        videos = []
+        for li in soup.select('ul.download-box li'):
+            # Check thumbnail
+            thumb_img = li.select_one('.download-items__thumb img')
+            thumbnail = ""
+            if thumb_img:
+                thumbnail = thumb_img.get('data-src') or thumb_img.get('src') or ""
+                if thumbnail == '/imgs/loader.gif':
+                    thumbnail = thumb_img.get('data-src') or ""
+            
+            # Check buttons
+            a_tags = li.select('.download-items__btn a')
+            video_url = None
+            for a in a_tags:
+                if a.has_attr('video'):
+                    video_url = a['video']
+                    break
+                text = a.text.lower()
+                if 'download video' in text:
+                    video_url = a.get('href')
+                    break
+                    
+            if not video_url and a_tags:
+                video_url = a_tags[0].get('href')
+                
+            if video_url:
+                videos.append({
+                    "url": video_url,
+                    "thumbnail": thumbnail
+                })
+        
+        return videos
+    except Exception as e:
+        logger.error(f"Scraper error: {e}")
+        return None
+
 @app.get("/igdl")
 def get_instagram_video(url: str = Query(..., description="Instagram video or post URL")):
     if not url:
@@ -83,7 +234,26 @@ def get_instagram_video(url: str = Query(..., description="Instagram video or po
                 }
             }
     except Exception as e:
-        logger.error(f"Instagram Fetch Error: {str(e)}")
+        logger.warning(f"yt-dlp failed to fetch Instagram Reel ({str(e)}). Retrying with SaveInsta fallback scraper...")
+        try:
+            scraped_data = scrape_instagram(url)
+            if scraped_data:
+                logger.info(f"Fallback scraper successfully retrieved media content: {scraped_data}")
+                return {
+                    "url": {
+                        "data": [
+                            {
+                                "url": item["url"],
+                                "thumbnail": item["thumbnail"]
+                            }
+                            for item in scraped_data
+                        ]
+                    }
+                }
+        except Exception as fallback_err:
+            logger.error(f"Fallback scraper also failed: {fallback_err}")
+            
+        logger.error(f"Instagram Fetch Error (both yt-dlp and fallback failed): {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram Reel: {str(e)}")
 
 # =====================================================================
